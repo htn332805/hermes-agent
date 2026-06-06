@@ -1243,7 +1243,23 @@ async function checkUpdates() {
   }
 
   branch = await resolveHealedBranch(updateRoot, branch)
-  const fetched = await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
+
+  // Installer checkouts are shallow (`git clone --depth 1`, PR #39423). On a
+  // shallow clone a plain `git fetch` unshallows the repo — dragging in the
+  // entire history — and `rev-list HEAD..origin/<branch> --count` then reports
+  // a huge bogus "behind" number. Detect shallow up front and (a) fetch with
+  // --depth 1 to preserve the boundary, (b) compare tip SHAs instead of
+  // counting. Full clones (developers, pre-#39423 installs) keep the exact
+  // count path unchanged.
+  const shallowProbe = await runGit(['rev-parse', '--is-shallow-repository'], { cwd: updateRoot })
+  const isShallow = shallowProbe.code === 0
+    ? shallowProbe.stdout.trim() === 'true'
+    : fileExists(path.join(gitDir, 'shallow'))  // older git fallback
+
+  const fetchArgs = isShallow
+    ? ['fetch', '--depth', '1', '--quiet', 'origin', branch]
+    : ['fetch', '--quiet', 'origin', branch]
+  const fetched = await runGit(fetchArgs, { cwd: updateRoot })
   if (fetched.code !== 0) {
     return {
       supported: true,
@@ -1256,6 +1272,38 @@ async function checkUpdates() {
   }
 
   const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
+
+  if (isShallow) {
+    // No history to count across the shallow boundary. `fetch origin <branch>`
+    // updated FETCH_HEAD; origin/<branch> may not be a tracking ref in a
+    // `clone --depth 1`, so prefer FETCH_HEAD and fall back to origin/<branch>.
+    const [currentSha, fetchHeadSha, originSha, dirtyStr, currentBranch] = await Promise.all([
+      git(['rev-parse', 'HEAD']),
+      git(['rev-parse', 'FETCH_HEAD']).catch(() => ''),
+      git(['rev-parse', `origin/${branch}`]).catch(() => ''),
+      git(['status', '--porcelain']),
+      git(['rev-parse', '--abbrev-ref', 'HEAD'])
+    ])
+    const targetSha = fetchHeadSha || originSha
+    // Can't enumerate commits across a shallow boundary; surface presence only.
+    const behind = targetSha && currentSha && targetSha !== currentSha ? 1 : 0
+
+    return {
+      supported: true,
+      branch,
+      currentBranch,
+      behind,
+      behindExact: false,
+      shallow: true,
+      currentSha,
+      targetSha,
+      commits: [],
+      dirty: dirtyStr.length > 0,
+      hermesRoot: updateRoot,
+      fetchedAt: Date.now()
+    }
+  }
+
   const [currentSha, targetSha, countStr, dirtyStr, currentBranch] = await Promise.all([
     git(['rev-parse', 'HEAD']),
     git(['rev-parse', `origin/${branch}`]),
@@ -1272,6 +1320,8 @@ async function checkUpdates() {
     branch,
     currentBranch,
     behind,
+    behindExact: true,
+    shallow: false,
     currentSha,
     targetSha,
     commits,

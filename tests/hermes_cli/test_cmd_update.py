@@ -825,3 +825,105 @@ termux = ["rich>=14"]
 
     assert hm._load_installable_optional_extras(group="all") == ["mcp"]
     assert hm._load_installable_optional_extras(group="termux-all") == ["termux", "mcp"]
+
+
+class TestCmdUpdateShallowClone:
+    """Shallow-aware update flow (installer `git clone --depth 1`, PR #39423).
+
+    On a shallow clone a plain `git fetch` un-shallows the repo and
+    `rev-list --count HEAD..origin/main` reports a bogus huge number. The
+    update flow must instead fetch `--depth 1` and reset to the fetched tip,
+    while full clones keep the historical fetch + count + ff-only path.
+
+    These tests fully mock `subprocess.run` — they never touch a real repo.
+    """
+
+    @staticmethod
+    def _shallow_side_effect(*, head_sha="aaa", target_sha="bbb"):
+        """subprocess.run side-effect simulating a shallow clone.
+
+        Records every git invocation in ``calls`` (attached to the returned
+        function) so tests can assert which commands ran.
+        """
+        calls: list[str] = []
+
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+            calls.append(joined)
+
+            # Shallow probe → "true"
+            if "rev-parse" in joined and "--is-shallow-repository" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="true\n", stderr="")
+            # current branch
+            if "rev-parse" in joined and "--abbrev-ref" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="main\n", stderr="")
+            # HEAD sha
+            if "rev-parse" in joined and joined.strip().endswith("HEAD"):
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{head_sha}\n", stderr="")
+            # tip sha (origin/main or FETCH_HEAD)
+            if "rev-parse" in joined and ("origin/main" in joined or "FETCH_HEAD" in joined):
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{target_sha}\n", stderr="")
+            if "rev-parse" in joined and "--verify" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            # rev-list must never run on a shallow clone — flag loudly if it does
+            if "rev-list" in joined:
+                raise AssertionError(f"rev-list should not run on shallow clone: {joined}")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        side_effect.calls = calls
+        return side_effect
+
+    @patch("hermes_cli.main._build_web_ui")
+    @patch("hermes_cli.main._update_node_dependencies")
+    @patch("hermes_cli.main._refresh_active_lazy_features")
+    @patch("hermes_cli.main._install_python_dependencies_with_optional_fallback")
+    @patch("hermes_cli.main._validate_critical_files_syntax", return_value=(True, None, None))
+    @patch("hermes_cli.main._clear_bytecode_cache", return_value=0)
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_shallow_fetches_depth1_and_resets(
+        self, mock_run, _which, _bytecode, _syntax, _deps, _lazy, _node, _web,
+        mock_args, monkeypatch, capsys,
+    ):
+        from hermes_cli import main as hm
+
+        # HEAD != tip → an update is available.
+        se = self._shallow_side_effect(head_sha="aaa", target_sha="bbb")
+        mock_run.side_effect = se
+        # Avoid touching real install-method detection / snapshots.
+        monkeypatch.setattr(hm, "detect_use_zip_update", lambda *a, **k: False, raising=False)
+
+        try:
+            hm.cmd_update(mock_args)
+        except SystemExit:
+            pass  # build steps are mocked; we only care about the git pipeline
+
+        joined_calls = se.calls
+        # 1) The fetch is shallow-preserving.
+        assert any("fetch --depth 1 origin main" in c for c in joined_calls), joined_calls
+        # 2) No plain `fetch origin` (which would un-shallow).
+        assert not any(c.endswith("fetch origin") for c in joined_calls), joined_calls
+        # 3) Advanced via reset to the fetched tip, not `pull --ff-only`.
+        assert any("reset --hard" in c for c in joined_calls), joined_calls
+        assert not any("pull --ff-only" in c for c in joined_calls), joined_calls
+
+    @patch("hermes_cli.config.detect_install_method", return_value="source")
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_check_shallow_compares_tips(
+        self, mock_run, _which, _method, capsys, monkeypatch,
+    ):
+        from hermes_cli import main as hm
+
+        # HEAD == tip → already up to date, and no rev-list runs.
+        se = self._shallow_side_effect(head_sha="same", target_sha="same")
+        mock_run.side_effect = se
+
+        hm._cmd_update_check(branch="main")
+
+        out = capsys.readouterr().out
+        assert "Already up to date" in out
+        # Shallow-preserving fetch, no plain fetch, no rev-list.
+        assert any("fetch --depth 1 origin main" in c for c in se.calls), se.calls
+        assert not any("rev-list" in c for c in se.calls), se.calls
+

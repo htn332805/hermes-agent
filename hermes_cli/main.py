@@ -6761,6 +6761,54 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
         return None
 
 
+def _is_shallow_clone(git_cmd, cwd) -> bool:
+    """Return True if ``cwd`` is a shallow git clone.
+
+    Installer checkouts are shallow (``git clone --depth 1``, see PR #39423).
+    On a shallow clone an ordinary ``git fetch`` un-shallows the repo —
+    pulling the entire history and defeating the installer's bandwidth
+    savings — and commit-distance math (``rev-list --count A..B``) across the
+    grafted boundary is bogus. ``hermes update`` uses this to fetch with
+    ``--depth 1`` and reset to the fetched tip instead of counting + ff-merging.
+
+    Defaults to False (treat as full clone) on any error, preserving the
+    historical behavior for developer checkouts and pre-#39423 full installs.
+    """
+    try:
+        result = subprocess.run(
+            git_cmd + ["rev-parse", "--is-shallow-repository"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    if result.returncode != 0:
+        # Older git (<2.15) lacks --is-shallow-repository; fall back to the
+        # presence of a `.git/shallow` file, the portable shallow signal.
+        try:
+            return (Path(cwd) / ".git" / "shallow").exists()
+        except OSError:
+            return False
+    return result.stdout.strip() == "true"
+
+
+def _git_rev(git_cmd, cwd, rev: str) -> str | None:
+    """Resolve ``rev`` to a commit SHA in ``cwd``, or None."""
+    try:
+        result = subprocess.run(
+            git_cmd + ["rev-parse", rev],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
     """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
 
@@ -9799,11 +9847,29 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
-    # Fetch both origin and upstream; prefer upstream as the canonical reference.
-    # Note: upstream/<branch> may not exist for non-main branches (a fork's
-    # bb/gui has no upstream counterpart), so when the caller picks a
-    # non-default branch we skip the upstream probe and use origin directly.
-    if branch == "main":
+    # Installer checkouts are shallow (`git clone --depth 1`, PR #39423).
+    # A plain fetch would un-shallow the repo and the `rev-list --count` below
+    # would be bogus across the grafted boundary. On a shallow clone we fetch
+    # `--depth 1` straight from origin (a shallow install has no `upstream`
+    # remote) and compare tip SHAs instead of counting. Full clones keep the
+    # historical upstream-preferred fetch + exact count path.
+    is_shallow = _is_shallow_clone(git_cmd, PROJECT_ROOT)
+
+    if is_shallow:
+        print("→ Fetching from origin...")
+        fetch_result = subprocess.run(
+            git_cmd + ["fetch", "--depth", "1", "origin", branch],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        upstream_exists = False
+        compare_branch = f"origin/{branch}"
+    elif branch == "main":
+        # Fetch both origin and upstream; prefer upstream as the canonical reference.
+        # Note: upstream/<branch> may not exist for non-main branches (a fork's
+        # bb/gui has no upstream counterpart), so when the caller picks a
+        # non-default branch we skip the upstream probe and use origin directly.
         print("→ Fetching from upstream...")
         fetch_result = subprocess.run(
             git_cmd + ["fetch", "upstream"],
@@ -9863,17 +9929,32 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         print(f"✗ Branch '{branch}' not found on {compare_branch.split('/', 1)[0]}.")
         sys.exit(1)
 
-    rev_result = subprocess.run(
-        git_cmd + ["rev-list", f"HEAD..{compare_branch}", "--count"],
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    behind = int(rev_result.stdout.strip())
+    if is_shallow:
+        # No history to count across the shallow boundary — compare tip SHAs.
+        local_sha = _git_rev(git_cmd, PROJECT_ROOT, "HEAD")
+        target_sha = (
+            _git_rev(git_cmd, PROJECT_ROOT, compare_branch)
+            or _git_rev(git_cmd, PROJECT_ROOT, "FETCH_HEAD")
+        )
+        behind = 0 if (local_sha and target_sha and local_sha == target_sha) else 1
+    else:
+        rev_result = subprocess.run(
+            git_cmd + ["rev-list", f"HEAD..{compare_branch}", "--count"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        behind = int(rev_result.stdout.strip())
 
     if behind == 0:
         print("✓ Already up to date.")
+    elif is_shallow:
+        # Exact count is unknowable on a shallow clone — report availability.
+        print(f"⚕ Update available on {compare_branch}.")
+        from hermes_cli.config import recommended_update_command
+
+        print(f"  Run '{recommended_update_command()}' to install.")
     else:
         commits_word = "commit" if behind == 1 else "commits"
         print(f"⚕ Update available: {behind} {commits_word} behind {compare_branch}.")
@@ -10337,9 +10418,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Fetch and pull
     try:
 
+        # Installer checkouts are shallow (`git clone --depth 1`, PR #39423).
+        # A plain `git fetch` would un-shallow the repo (negating the
+        # installer's bandwidth savings) and make the `rev-list --count`
+        # below report a bogus huge number. Detect shallow once and fetch
+        # `--depth 1` to keep the boundary; full clones (developers,
+        # pre-#39423 installs) keep the historical plain-fetch + count path.
+        is_shallow = _is_shallow_clone(git_cmd, PROJECT_ROOT)
+
         print("→ Fetching updates...")
+        fetch_args = ["fetch", "origin"]
+        if is_shallow:
+            fetch_args = ["fetch", "--depth", "1", "origin", _resolve_update_branch(args)]
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin"],
+            git_cmd + fetch_args,
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -10431,15 +10523,29 @@ def _cmd_update_impl(args, gateway_mode: bool):
             and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
         )
 
-        # Check if there are updates
-        result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        commit_count = int(result.stdout.strip())
+        # Check if there are updates. On a shallow clone there is no history
+        # to count across the grafted boundary, so `rev-list HEAD..origin/X`
+        # would be bogus — compare tip SHAs instead and treat any difference
+        # as "an update is available" (exact count is unknowable). Full clones
+        # keep the precise count.
+        if is_shallow:
+            local_sha = _git_rev(git_cmd, PROJECT_ROOT, "HEAD")
+            target_sha = (
+                _git_rev(git_cmd, PROJECT_ROOT, f"origin/{branch}")
+                or _git_rev(git_cmd, PROJECT_ROOT, "FETCH_HEAD")
+            )
+            commit_count = (
+                0 if (local_sha and target_sha and local_sha == target_sha) else 1
+            )
+        else:
+            result = subprocess.run(
+                git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            commit_count = int(result.stdout.strip())
 
         if commit_count == 0:
             _invalidate_update_cache()
@@ -10468,7 +10574,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("✓ Already up to date!")
             return
 
-        print(f"→ Found {commit_count} new commit(s)")
+        if is_shallow:
+            print("→ Update available")
+        else:
+            print(f"→ Found {commit_count} new commit(s)")
 
         # Snapshot critical state (state.db, config, pairing JSONs, etc.)
         # before pulling so a user can recover if something goes wrong.
@@ -10496,33 +10605,61 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # the bad commit and the fix landing).
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
         try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+            if is_shallow:
+                # Shallow clone: there's no merge base to fast-forward across,
+                # and `pull` would re-negotiate full history and un-shallow the
+                # repo. The `--depth 1` fetch above already advanced
+                # origin/{branch} (and FETCH_HEAD) to the new tip, so hard-reset
+                # the working tree to it — this keeps the clone shallow and is
+                # the equivalent of a fast-forward for a single-commit install.
+                reset_target = (
+                    f"origin/{branch}"
+                    if _git_rev(git_cmd, PROJECT_ROOT, f"origin/{branch}")
+                    else "FETCH_HEAD"
                 )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                pull_result = subprocess.run(
+                    git_cmd + ["reset", "--hard", reset_target],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
+                if pull_result.returncode != 0:
+                    print(f"✗ Failed to update to {reset_target} (shallow).")
+                    if pull_result.stderr.strip():
+                        print(f"  {pull_result.stderr.strip().splitlines()[0]}")
                     print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        f"  Try manually: git fetch --depth 1 origin {branch} && "
+                        f"git reset --hard origin/{branch}"
                     )
                     sys.exit(1)
+            else:
+                pull_result = subprocess.run(
+                    git_cmd + ["pull", "--ff-only", "origin", branch],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                if pull_result.returncode != 0:
+                    # ff-only failed — local and remote have diverged (e.g. upstream
+                    # force-pushed or rebase).  Since local changes are already
+                    # stashed, reset to match the remote exactly.
+                    print(
+                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                    )
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if reset_result.returncode != 0:
+                        print(f"✗ Failed to reset to origin/{branch}.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print(
+                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        )
+                        sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit

@@ -144,16 +144,116 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
 
 
+def _is_shallow_clone(repo_dir: Path) -> bool:
+    """Return True if ``repo_dir`` is a shallow git clone.
+
+    Installer-created checkouts are shallow (``git clone --depth 1``, see
+    PR #39423). A shallow clone has no usable history before the grafted
+    boundary, so commit-distance math (``rev-list --count A..B``) is
+    meaningless and an ordinary ``git fetch`` would *unshallow* the repo —
+    pulling the entire history and making the count explode. Callers use
+    this to branch into a tip-comparison path instead.
+
+    Defaults to False (treat as full clone) on any error, so developer
+    checkouts and pre-#39423 full installs keep the exact count path.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-shallow-repository"],
+            capture_output=True, text=True, timeout=5,
+            cwd=str(repo_dir),
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        # Older git (<2.15) lacks --is-shallow-repository; the presence of a
+        # `.git/shallow` file is the portable fallback signal.
+        return (repo_dir / ".git" / "shallow").exists()
+    return result.stdout.strip() == "true"
+
+
+def _git_rev(repo_dir: Path, rev: str) -> Optional[str]:
+    """Resolve ``rev`` to a full commit SHA in ``repo_dir``, or None."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", rev],
+            capture_output=True, text=True, timeout=5,
+            cwd=str(repo_dir),
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    value = (result.stdout or "").strip()
+    return value or None
+
+
+def _ls_remote_main(repo_dir: Path) -> Optional[str]:
+    """Return origin's ``refs/heads/main`` tip SHA via ls-remote, or None.
+
+    Authoritative upstream-tip lookup that does NOT depend on local tracking
+    refs — the reliable way to learn the remote head of a shallow clone,
+    where ``origin/main`` may be missing (tag-pinned clone) or stale.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "origin", "refs/heads/main"],
+            capture_output=True, text=True, timeout=10,
+            cwd=str(repo_dir),
+        )
+    except Exception:
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    return result.stdout.split()[0] or None
+
+
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
+    """Report whether a local checkout is behind origin/main.
+
+    Supports both shapes of install:
+
+    * **Shallow clone** (installer, ``--depth 1``): a plain ``git fetch``
+      would unshallow the repo and a ``HEAD..origin/main`` count would be
+      bogus. So we fetch shallow (``--depth 1``) to keep the boundary, then
+      compare the local HEAD SHA against the freshly-fetched ``origin/main``
+      tip. Equal → ``0`` (up to date); different → ``UPDATE_AVAILABLE_NO_COUNT``
+      (behind, but an exact count is impossible across a shallow boundary).
+
+    * **Full clone** (developer checkout, or installs from before #39423):
+      ordinary fetch + exact ``rev-list --count HEAD..origin/main``.
+    """
+    shallow = _is_shallow_clone(repo_dir)
+
+    fetch_cmd = ["git", "fetch", "origin", "main", "--quiet"]
+    if shallow:
+        # Keep the clone shallow — otherwise the fetch drags in the entire
+        # history and the count below explodes (see #39423 fallout).
+        fetch_cmd = ["git", "fetch", "--depth", "1", "origin", "main", "--quiet"]
     try:
         subprocess.run(
-            ["git", "fetch", "origin", "--quiet"],
+            fetch_cmd,
             capture_output=True, timeout=10,
             cwd=str(repo_dir),
         )
     except Exception:
         pass  # Offline or timeout — use stale refs, that's fine
+
+    if shallow:
+        # No usable history to count across the shallow boundary — compare
+        # tip SHAs instead. Resolving the upstream tip from local tracking
+        # refs is unreliable on a `clone --depth 1` (origin/main may be a
+        # detached fetch, a tag-pinned clone has no origin/main at all), so
+        # ask the remote authoritatively via ls-remote — the same approach
+        # _check_via_rev() uses for nix builds — and only fall back to
+        # FETCH_HEAD / origin/main if the remote probe fails (offline).
+        local = _git_rev(repo_dir, "HEAD")
+        upstream = _ls_remote_main(repo_dir)
+        if not upstream:
+            upstream = _git_rev(repo_dir, "FETCH_HEAD") or _git_rev(repo_dir, "origin/main")
+        if not local or not upstream:
+            return None
+        return 0 if local == upstream else UPDATE_AVAILABLE_NO_COUNT
 
     try:
         result = subprocess.run(
@@ -358,18 +458,25 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
         return None
 
     ahead = 0
-    try:
-        result = subprocess.run(
-            ["git", "rev-list", "--count", "origin/main..HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            cwd=str(repo_dir),
-        )
-        if result.returncode == 0:
-            ahead = int((result.stdout or "0").strip() or "0")
-    except Exception:
-        ahead = 0
+    # On a shallow clone there is no history before the grafted boundary, so
+    # `origin/main..HEAD` would be bogus (and any fetch that populated
+    # origin/main already happened via the shallow-preserving path elsewhere).
+    # A `--depth 1` install is pinned to a single commit, so "carried commits"
+    # is definitionally zero — skip the count and report ahead=0. Full clones
+    # (developers, pre-#39423 installs) keep the exact count.
+    if not _is_shallow_clone(repo_dir):
+        try:
+            result = subprocess.run(
+                ["git", "rev-list", "--count", "origin/main..HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                cwd=str(repo_dir),
+            )
+            if result.returncode == 0:
+                ahead = int((result.stdout or "0").strip() or "0")
+        except Exception:
+            ahead = 0
 
     return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
 
