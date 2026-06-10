@@ -368,6 +368,71 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List
         )
 
 
+def _maybe_apply_session_routing(agent, user_message, conversation_history) -> None:
+    """Smart model routing at session start (cache-safe).
+
+    Fires at most once per agent, and only on the FIRST turn of a *fresh*
+    session (empty ``conversation_history`` → no cached prefix to break).
+    Picks a tier-appropriate model BEFORE the system prompt is built, then
+    applies it via the same ``switch_model`` path ``/model`` uses (which
+    nulls ``_cached_system_prompt`` so the prompt rebuilds for the new
+    model). Everything is fail-open: any error leaves the agent untouched.
+    """
+    if getattr(agent, "_smart_routing_applied", False):
+        return
+    # Only route a genuinely fresh session — never swap the model into a
+    # resumed conversation, which would invalidate its cached history.
+    if conversation_history:
+        agent._smart_routing_applied = True
+        return
+    try:
+        from agent import model_router
+
+        routing_cfg = model_router.get_routing_config()
+        if not routing_cfg.get("enabled") or not routing_cfg.get("apply_to_sessions", True):
+            agent._smart_routing_applied = True
+            return
+
+        decision = model_router.route(
+            user_message,
+            current_model=getattr(agent, "model", "") or "",
+            current_provider=getattr(agent, "provider", "") or "",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("session routing: classification failed: %s", exc)
+        agent._smart_routing_applied = True
+        return
+
+    # Mark applied regardless of outcome so we never re-classify this agent.
+    agent._smart_routing_applied = True
+    if decision is None:
+        return
+
+    try:
+        agent.switch_model(
+            new_model=decision.model,
+            new_provider=decision.provider,
+            api_key=decision.api_key or "",
+            base_url=decision.base_url or "",
+            api_mode=decision.api_mode or "",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("session routing: switch_model failed (%s) — staying", exc)
+        return
+
+    logger.info(
+        "session routing: tier=%s → %s (%s)",
+        decision.tier, decision.model, decision.provider,
+    )
+    if routing_cfg.get("announce", True) and not getattr(agent, "quiet_mode", False):
+        try:
+            agent._safe_print(
+                f"\n🧭 Auto-routed to {decision.model} ({decision.tier} tier)"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def run_conversation(
     agent,
     user_message: str,
@@ -396,6 +461,12 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    # ── Smart model routing (session start, cache-safe) ──
+    # Runs BEFORE build_turn_context so the (model-specific) system prompt is
+    # built for the routed model. No-op unless smart_model_routing.enabled and
+    # this is the first turn of a fresh session. See _maybe_apply_session_routing.
+    _maybe_apply_session_routing(agent, user_message, conversation_history)
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-

@@ -2111,19 +2111,23 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            # Smart model routing: pick a tier-appropriate model per task by
+            # its goal (no-op unless smart_model_routing.enabled and delegation
+            # didn't pin a model). Cache-safe — children start fresh.
+            task_creds = _route_task_creds(creds, t.get("goal", ""), parent_agent)
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
                 override_acp_command=t.get("acp_command")
                 or acp_command
                 or creds.get("command"),
@@ -2567,6 +2571,53 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
     }
+
+
+def _route_task_creds(base_creds: dict, goal: str, parent_agent) -> dict:
+    """Apply smart_model_routing to one delegated task's credentials.
+
+    Cache-safe by construction: subagents start from a fresh context, so
+    picking a per-task model never invalidates any cached prefix. Only acts
+    when delegation didn't already pin a model (explicit ``delegation.model``
+    wins) and ``smart_model_routing`` is enabled with ``apply_to_delegation``.
+    Fail-open: returns ``base_creds`` unchanged on any miss or error, so the
+    child inherits the parent model exactly as before.
+    """
+    if base_creds.get("model"):
+        return base_creds  # explicit delegation model wins over routing
+    try:
+        from agent import model_router
+
+        rcfg = model_router.get_routing_config()
+        if not rcfg.get("enabled") or not rcfg.get("apply_to_delegation", True):
+            return base_creds
+        decision = model_router.route(
+            goal or "",
+            current_model=getattr(parent_agent, "model", "") or "",
+            current_provider=getattr(parent_agent, "provider", "") or "",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("delegation routing: classification failed: %s", exc)
+        return base_creds
+
+    if decision is None:
+        return base_creds  # no-op / stays on parent model
+
+    logger.info(
+        "delegation routing: tier=%s → %s (%s)",
+        decision.tier, decision.model, decision.provider,
+    )
+    routed = dict(base_creds)
+    routed.update(
+        {
+            "model": decision.model,
+            "provider": decision.provider,
+            "base_url": decision.base_url,
+            "api_key": decision.api_key,
+            "api_mode": decision.api_mode,
+        }
+    )
+    return routed
 
 
 def _load_config() -> dict:

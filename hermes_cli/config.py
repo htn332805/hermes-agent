@@ -1341,6 +1341,20 @@ DEFAULT_CONFIG = {
             "timeout": 600,
             "extra_body": {},
         },
+        # Routing classifier — the cheap "picker" that smart_model_routing
+        # consults to label an incoming request's complexity tier (light /
+        # standard / heavy). Point this at a small, fast model: it runs once
+        # per fresh session and per delegated subtask, so an expensive model
+        # here defeats the purpose. "auto" = use the main chat model (works,
+        # but you should override with e.g. openrouter google/gemini-3-flash-preview).
+        "routing_classifier": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 20,
+            "extra_body": {},
+        },
     },
     
     "display": {
@@ -1716,6 +1730,41 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+    },
+
+    # Smart model routing — a cheap "picker" classifies an incoming request's
+    # complexity tier and routes it to a tier-appropriate model. Mirrors the
+    # Cursor "Auto" idea (right-size the model to the task) while respecting
+    # Hermes' sacred prompt-cache: routing only ever happens at points where
+    # there is no cached prefix to invalidate — at the START of a fresh
+    # session (before the first API call) and at each delegate_task boundary
+    # (subagents get fresh context). It never swaps the main model mid-
+    # conversation (that is what `/model` is for, and it resets the cache).
+    #
+    # Off by default. The classifier runs via auxiliary.routing_classifier —
+    # point that at a cheap, fast model (see its comment above).
+    "smart_model_routing": {
+        "enabled": False,            # master switch
+        "apply_to_sessions": True,   # route at the start of a fresh session
+        "apply_to_delegation": True, # route delegated subtasks by their goal
+        # Where each complexity tier goes. Leave provider+model empty to
+        # "stay on the current/parent model" for that tier — that is the
+        # natural baseline for `standard`. Credentials (base_url, api_key,
+        # api_mode) are resolved automatically from the provider, exactly
+        # like delegation.provider/model.
+        "tiers": {
+            "light":    {"provider": "", "model": ""},  # e.g. openrouter / google/gemini-3-flash-preview
+            "standard": {"provider": "", "model": ""},  # empty = main model
+            "heavy":    {"provider": "", "model": ""},  # e.g. anthropic / claude-opus-4.7
+        },
+        # Tier used when the classifier is unreachable or returns garbage.
+        # Fail-open: a broken picker must never wedge a turn.
+        "default_tier": "standard",
+        # Quality-first guardrail: never route below this tier. Set to
+        # "standard" to forbid the "light" tier entirely. Empty = no floor.
+        "min_tier": "",
+        # Surface the routing decision to the user (tier + chosen model).
+        "announce": True,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
